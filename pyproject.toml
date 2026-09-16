@@ -111,8 +111,8 @@ disallow_untyped_defs = false
 docstring-code-format = true  # Formats code blocks in docstrings
 
 [tool.ruff.lint]
-# An empty `select` selects no rules at all, which also makes every entry in
-# `ignore` and `per-file-ignores` below inert. These are ruff's defaults.
+# Pyflakes plus the pycodestyle checks worth enforcing; `ignore` and
+# `per-file-ignores` below subtract from this set.
 select = [
     "E4",  # pycodestyle — imports
     "E7",  # pycodestyle — statements
