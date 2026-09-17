@@ -345,6 +345,26 @@ def test_model_kwargs_destination_decides_the_key(_no_provider_env: None) -> Non
     assert llm._client_params["api_key"] == "sk-anthropic"
 
 
+def test_model_kwargs_api_key_survives_a_redirect(_no_provider_env: None) -> None:
+    """A generic key is provider-agnostic wherever it was supplied.
+
+    `model_kwargs["api_key"]` reaches litellm like the field does, so a redirect must
+    not replace it with a provider-scoped resolution.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        anthropic_api_key="sk-anthropic",
+        model_kwargs={"api_key": "sk-generic"},
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-generic"
+
+
 def test_model_kwargs_credentials_are_not_clobbered(_no_provider_env: None) -> None:
     """An unset field must not overwrite the same key supplied via model_kwargs."""
     llm = ChatLiteLLM(

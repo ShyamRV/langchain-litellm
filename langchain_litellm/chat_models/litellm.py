@@ -538,6 +538,12 @@ class ChatLiteLLM(BaseChatModel):
         """
         if self.api_key:
             return self.api_key
+        # A generic key supplied through model_kwargs is as provider-agnostic and as
+        # explicit as the field, so it takes the same precedence rather than being
+        # replaced by a provider-scoped resolution when a call redirects.
+        explicit = (self.model_kwargs or {}).get("api_key")
+        if explicit:
+            return explicit
 
         default_model, default_provider = self._constructor_destination()
         provider = custom_llm_provider or default_provider
