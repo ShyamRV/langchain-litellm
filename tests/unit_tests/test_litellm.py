@@ -285,6 +285,22 @@ def test_redirect_re_resolves_only_the_inferred_credential(
     assert kwargs["extra_headers"] == {"X-Team": "platform"}
 
 
+def test_base_model_survives_a_redirect(_no_provider_env: None) -> None:
+    """`base_model` is caller configuration, not something inferred from the model.
+
+    It drives cost attribution for deployments litellm's cost map does not know, so
+    dropping it on a redirect would silently misattribute spend.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai", base_model="gpt-4o")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    assert mock_completion.call_args.kwargs["base_model"] == "gpt-4o"
+
+
 def test_a_pinned_api_base_keeps_its_credential_across_a_redirect(
     _no_provider_env: None,
 ) -> None:
