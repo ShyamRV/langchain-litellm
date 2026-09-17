@@ -78,7 +78,7 @@ from langchain_core.outputs import (
 )
 from langchain_core.runnables import Runnable, RunnablePassthrough
 from langchain_core.tools import BaseTool
-from langchain_core.utils import get_from_dict_or_env, pre_init
+from langchain_core.utils import pre_init
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from langchain_core.utils.pydantic import TypeBaseModel, is_basemodel_subclass
 from litellm.types.utils import Delta
@@ -102,16 +102,18 @@ _PROVIDER_FIELD_ALIASES = {
 }
 
 
-def _provider_api_key_field(provider: Optional[str]) -> Optional[str]:
-    """Name the field holding this provider's key, or None if there is no such field.
+def _provider_api_key_field(
+    cls: Type[BaseModel], provider: Optional[str]
+) -> Optional[str]:
+    """Name the field holding this provider's key on ``cls``, or None if it has none.
 
-    Checking against ``model_fields`` keeps this honest: a field that is renamed or
-    removed stops resolving, instead of reading as unset through ``getattr``.
+    Reading ``model_fields`` off the runtime class keeps this honest and lets a
+    subclass contribute a provider the base class does not declare.
     """
     if not provider:
         return None
     field = f"{_PROVIDER_FIELD_ALIASES.get(provider, provider)}_api_key"
-    return field if field in ChatLiteLLM.model_fields else None
+    return field if field in cls.model_fields else None
 
 
 class ChatLiteLLMException(Exception):
@@ -541,6 +543,14 @@ class ChatLiteLLM(BaseChatModel):
         if explicit:
             return explicit
 
+        # With no provider-scoped key set there is nothing to attribute, and asking
+        # litellm to attribute a proxy deployment name costs a banner on stdout.
+        fields = type(self).model_fields
+        if not any(
+            getattr(self, name, None) for name in fields if name.endswith("_api_key")
+        ):
+            return None
+
         default_model, default_provider = self._constructor_destination()
         provider = custom_llm_provider or default_provider
         if not provider:
@@ -549,19 +559,18 @@ class ChatLiteLLM(BaseChatModel):
                 return None
             try:
                 _, provider, _, _ = litellm.get_llm_provider(model=effective_model)
-            except Exception:
-                # litellm raises for model strings it cannot attribute. Defer to
-                # its own credential resolution rather than guessing a provider.
+            except litellm.BadRequestError:
+                # The one expected failure: litellm cannot attribute this model, so
+                # defer to its own credential resolution rather than guess.
                 logger.debug(
                     "No provider attributed to %r; leaving api_key unset.",
                     effective_model,
                 )
                 return None
 
-        field = _provider_api_key_field(provider)
+        field = _provider_api_key_field(type(self), provider)
         if field is None:
             return None
-        # validate_environment defaults these fields to "" rather than None.
         return getattr(self, field, None) or None
 
     def _merge_call_params(
@@ -666,30 +675,6 @@ class ChatLiteLLM(BaseChatModel):
         if base_url is not None and values.get("api_base") is None:
             values["api_base"] = base_url
 
-        values["openai_api_key"] = get_from_dict_or_env(
-            values, "openai_api_key", "OPENAI_API_KEY", default=""
-        )
-        values["azure_api_key"] = get_from_dict_or_env(
-            values, "azure_api_key", "AZURE_API_KEY", default=""
-        )
-        values["anthropic_api_key"] = get_from_dict_or_env(
-            values, "anthropic_api_key", "ANTHROPIC_API_KEY", default=""
-        )
-        values["replicate_api_key"] = get_from_dict_or_env(
-            values, "replicate_api_key", "REPLICATE_API_KEY", default=""
-        )
-        values["openrouter_api_key"] = get_from_dict_or_env(
-            values, "openrouter_api_key", "OPENROUTER_API_KEY", default=""
-        )
-        values["cohere_api_key"] = get_from_dict_or_env(
-            values, "cohere_api_key", "COHERE_API_KEY", default=""
-        )
-        values["huggingface_api_key"] = get_from_dict_or_env(
-            values, "huggingface_api_key", "HUGGINGFACE_API_KEY", default=""
-        )
-        values["together_ai_api_key"] = get_from_dict_or_env(
-            values, "together_ai_api_key", "TOGETHERAI_API_KEY", default=""
-        )
         values["client"] = litellm
 
         if values["temperature"] is not None and not 0 <= values["temperature"] <= 2:

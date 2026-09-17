@@ -19,11 +19,11 @@ from pydantic import BaseModel
 from langchain_litellm._version import __version__
 from langchain_litellm.chat_models import ChatLiteLLM
 from langchain_litellm.chat_models.litellm import (
-    _provider_api_key_field,
     _convert_delta_to_message_chunk,
     _convert_dict_to_message,
     _convert_message_to_dict,
     _create_usage_metadata,
+    _provider_api_key_field,
 )
 
 
@@ -245,16 +245,22 @@ def test_per_call_model_override_selects_that_providers_key(
     assert mock_completion.call_args.kwargs["api_key"] == "sk-anthropic"
 
 
-def test_env_collected_keys_have_fields_to_land_in(_no_provider_env: None) -> None:
-    """`validate_environment` reads these, so they must be declared to survive.
+@pytest.mark.parametrize(
+    ("provider", "field"),
+    [("huggingface", "huggingface_api_key"), ("together_ai", "together_ai_api_key")],
+)
+def test_late_declared_provider_keys_reach_litellm(
+    _no_provider_env: None, provider: str, field: str
+) -> None:
+    """These two had no field, so pydantic discarded whatever the caller passed."""
+    llm = ChatLiteLLM(model=f"{provider}/some-model", **{field: "sk-late"})
 
-    Without the fields, pydantic discarded the values and both the environment read
-    and the constructor kwarg were inert.
-    """
-    for field in ("huggingface_api_key", "together_ai_api_key"):
-        assert field in ChatLiteLLM.model_fields, field
-    assert _provider_api_key_field("huggingface") == "huggingface_api_key"
-    assert _provider_api_key_field("together_ai") == "together_ai_api_key"
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-late"
 
 
 def test_an_ambient_env_key_is_not_sent_as_a_credential(
@@ -307,8 +313,9 @@ def test_no_provider_key_configured_skips_the_registry_lookup(
     """
     llm = ChatLiteLLM(model="my-deployment")
 
-    with patch.object(litellm, "get_llm_provider") as mock_lookup, patch.object(
-        llm.client, "completion", return_value=_MOCK_OK
+    with (
+        patch.object(litellm, "get_llm_provider") as mock_lookup,
+        patch.object(llm.client, "completion", return_value=_MOCK_OK),
     ):
         llm.invoke("hi", custom_llm_provider="openai")
 
@@ -325,9 +332,7 @@ def test_a_subclass_provider_key_field_is_forwarded(_no_provider_env: None) -> N
     class _DeepSeekChat(ChatLiteLLM):
         deepseek_api_key: Optional[str] = None
 
-    llm = _DeepSeekChat(
-        model="deepseek/deepseek-chat", deepseek_api_key="sk-deepseek"
-    )
+    llm = _DeepSeekChat(model="deepseek/deepseek-chat", deepseek_api_key="sk-deepseek")
 
     with patch.object(
         llm.client, "completion", return_value=_MOCK_OK
@@ -528,12 +533,15 @@ def test_model_kwargs_credentials_are_not_clobbered(_no_provider_env: None) -> N
 
 def test_provider_api_key_field_is_derived_from_declared_fields() -> None:
     """The mapping follows the `<provider>_api_key` convention, with aliases named."""
-    assert _provider_api_key_field("anthropic") == "anthropic_api_key"
-    assert _provider_api_key_field("cohere_chat") == "cohere_api_key"
-    assert _provider_api_key_field("text-completion-openai") == "openai_api_key"
+    assert _provider_api_key_field(ChatLiteLLM, "anthropic") == "anthropic_api_key"
+    assert _provider_api_key_field(ChatLiteLLM, "cohere_chat") == "cohere_api_key"
+    assert (
+        _provider_api_key_field(ChatLiteLLM, "text-completion-openai")
+        == "openai_api_key"
+    )
     # No declared field, so no key is guessed.
-    assert _provider_api_key_field("bedrock") is None
-    assert _provider_api_key_field(None) is None
+    assert _provider_api_key_field(ChatLiteLLM, "bedrock") is None
+    assert _provider_api_key_field(ChatLiteLLM, None) is None
 
 
 def test_per_call_custom_llm_provider_does_not_reuse_the_other_providers_key(

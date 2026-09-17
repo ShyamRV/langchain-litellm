@@ -104,9 +104,7 @@ def test_router_keeps_a_model_kwargs_api_key_across_a_redirect() -> None:
 
     Withholding a key is only ever right for one inferred from the destination.
     """
-    llm = ChatLiteLLMRouter(
-        router=make_router(), model_kwargs={"api_key": "sk-caller"}
-    )
+    llm = ChatLiteLLMRouter(router=make_router(), model_kwargs={"api_key": "sk-caller"})
 
     with patch.object(
         llm.router, "completion", return_value=_router_usage()

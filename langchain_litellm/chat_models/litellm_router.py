@@ -82,20 +82,6 @@ class ChatLiteLLMRouter(ChatLiteLLM):
                 return
         raise ValueError(f"Model {model_name} not found in model_list.")
 
-    def _resolve_api_key(
-        self,
-        model: Optional[str] = None,
-        custom_llm_provider: Optional[str] = None,
-    ) -> Optional[str]:
-        """Never infer a provider key here; deployments carry their own.
-
-        ``litellm.Router`` resolves each deployment's credential from its own
-        ``litellm_params``. A provider-scoped field picked up from the
-        environment would be forwarded as a clientside key and override that,
-        so only an explicitly supplied ``api_key`` is passed through.
-        """
-        return self.api_key or None
-
     def completion_with_retry(
         self, run_manager: Optional[CallbackManagerForLLMRun] = None, **kwargs: Any
     ) -> Any:
