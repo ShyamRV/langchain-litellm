@@ -92,10 +92,6 @@ logger = logging.getLogger(__name__)
 # Per-call kwargs that decide WHERE litellm sends the request.
 _DESTINATION_KEYS = ("model", "custom_llm_provider")
 
-# Params scoped to a destination: correct for the one they were configured against
-# and wrong for any other, so they are dropped when a call redirects elsewhere.
-_DESTINATION_SCOPED_PARAMS = ("api_base", "organization", "extra_headers", "base_model")
-
 # A provider's key lives in the field named `<provider>_api_key`, so the mapping is
 # derived from the declared fields rather than restated. Only litellm provider ids
 # that do NOT follow that convention need an entry here.
@@ -579,11 +575,12 @@ class ChatLiteLLM(BaseChatModel):
         resolved against the constructor's destination. A caller may redirect the
         request per call with ``model`` or ``custom_llm_provider``.
 
-        When that happens, values scoped to the old destination must not follow the
-        request to the new one: the credential is re-resolved, and the rest are
-        dropped so litellm resolves them for the destination actually being used. A
-        caller who wants one of them at the new destination passes it in this call,
-        which wins by the merge.
+        Only the provider-scoped credential is INFERRED from that destination, so only
+        it is re-resolved when the destination changes. ``api_base``, ``organization``
+        and ``extra_headers`` are never inferred — they exist because a caller set
+        them — so they survive a redirect untouched. When an ``api_base`` is pinned the
+        request goes to that one gateway whatever the model is, so the credential is
+        left alone as well.
 
         A ``None`` override means "not supplied", matching how litellm reads params.
         """
@@ -600,14 +597,15 @@ class ChatLiteLLM(BaseChatModel):
         if not redirected:
             return merged
 
-        if kwargs.get("api_key") is None:
+        # A pinned endpoint means the request goes to one gateway whatever the model
+        # is, so the credential for that gateway must not be swapped for a
+        # provider-scoped one. Everything else here is explicit caller configuration
+        # and survives untouched.
+        if kwargs.get("api_key") is None and merged.get("api_base") is None:
             merged["api_key"] = self._resolve_api_key(
                 model=redirected.get("model"),
                 custom_llm_provider=redirected.get("custom_llm_provider"),
             )
-        for key in _DESTINATION_SCOPED_PARAMS:
-            if kwargs.get(key) is None:
-                merged.pop(key, None)
         return merged
 
     @property

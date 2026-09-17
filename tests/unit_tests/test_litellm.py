@@ -257,22 +257,21 @@ def test_env_collected_keys_have_fields_to_land_in(_no_provider_env: None) -> No
     assert _provider_api_key_field("together_ai") == "together_ai_api_key"
 
 
-def test_redirect_drops_destination_scoped_params(_no_provider_env: None) -> None:
-    """Values configured for one destination must not follow a redirect to another.
+def test_redirect_re_resolves_only_the_inferred_credential(
+    _no_provider_env: None,
+) -> None:
+    """Only the provider-scoped key is inferred from the destination.
 
-    `api_base`, `organization`, `extra_headers` and `base_model` are all resolved
-    against the constructor's destination. Fixing only the credential would send
-    the NEW provider's key to the OLD provider's endpoint, which is worse than
-    leaving both stale.
+    `api_base`, `organization` and `extra_headers` exist because a caller set them,
+    so a redirect must not discard that intent. Without an `api_base` pinned, the
+    key is the one thing derived from where the request goes, so it re-resolves.
     """
     llm = ChatLiteLLM(
         model="gpt-4o",
         openai_api_key="sk-openai",
         anthropic_api_key="sk-anthropic",
-        api_base="https://openai-proxy.internal/v1",
         organization="org-openai",
-        extra_headers={"OpenAI-Beta": "assistants=v2"},
-        base_model="gpt-4o",
+        extra_headers={"X-Team": "platform"},
     )
 
     with patch.object(
@@ -282,8 +281,33 @@ def test_redirect_drops_destination_scoped_params(_no_provider_env: None) -> Non
 
     kwargs = mock_completion.call_args.kwargs
     assert kwargs["api_key"] == "sk-anthropic"
-    for scoped in ("api_base", "organization", "extra_headers", "base_model"):
-        assert kwargs.get(scoped) is None, scoped
+    assert kwargs["organization"] == "org-openai"
+    assert kwargs["extra_headers"] == {"X-Team": "platform"}
+
+
+def test_a_pinned_api_base_keeps_its_credential_across_a_redirect(
+    _no_provider_env: None,
+) -> None:
+    """A pinned endpoint is one gateway serving many models on one credential.
+
+    Swapping in a provider-scoped key would send the wrong credential to that
+    gateway, and dropping the endpoint would ignore the caller's explicit choice.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        openai_api_key="sk-openai",
+        anthropic_api_key="sk-anthropic",
+        api_base="https://gateway.internal/v1",
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs["api_base"] == "https://gateway.internal/v1"
+    assert kwargs["api_key"] == "sk-openai"
 
 
 def test_caller_supplied_destination_params_survive_a_redirect(

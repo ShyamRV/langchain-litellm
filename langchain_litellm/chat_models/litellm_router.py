@@ -18,7 +18,6 @@ from langchain_core.messages import (
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 from langchain_litellm.chat_models.litellm import (
-    _DESTINATION_SCOPED_PARAMS,
     ChatLiteLLM,
     _convert_delta_to_message_chunk,
     _convert_dict_to_message,
@@ -61,8 +60,9 @@ class ChatLiteLLMRouter(ChatLiteLLM):
     def _prepare_params_for_router(self, params: Any) -> None:
         """Add the metadata slot the Router fills in.
 
-        Letting the Router choose ``api_base`` from its deployment is handled in
-        ``_merge_call_params``, which removes the connector's before this point.
+        A ``None`` ``api_base`` is already stripped by the caller's None filter, so
+        the Router picks its deployment's own; an explicitly configured one is the
+        caller's choice and is left alone.
         """
         params.setdefault("metadata", {})
 
@@ -81,23 +81,6 @@ class ChatLiteLLMRouter(ChatLiteLLM):
                 self.model = model_name
                 return
         raise ValueError(f"Model {model_name} not found in model_list.")
-
-    def _merge_call_params(
-        self, params: Dict[str, Any], kwargs: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Drop destination-scoped params on every call, not only on a redirect.
-
-        ``litellm.Router`` selects a deployment per request, so a value configured
-        on this connector is scoped to a destination the Router may not choose.
-        Each deployment carries its own endpoint, credential and headers in its
-        ``litellm_params``; forwarding the connector's would override them. A caller
-        who wants one for this specific call passes it here, and it wins by merge.
-        """
-        merged = super()._merge_call_params(params, kwargs)
-        for key in _DESTINATION_SCOPED_PARAMS:
-            if kwargs.get(key) is None:
-                merged.pop(key, None)
-        return merged
 
     def _resolve_api_key(
         self,
