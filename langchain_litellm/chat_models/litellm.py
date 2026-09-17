@@ -89,18 +89,33 @@ from langchain_litellm._version import __version__
 
 logger = logging.getLogger(__name__)
 
-# Maps a litellm provider identifier to the ChatLiteLLM field holding that
-# provider's key. `get_llm_provider` reports Cohere chat models as
-# "cohere_chat", so both spellings resolve to the same field.
-_PROVIDER_API_KEY_FIELDS = {
-    "anthropic": "anthropic_api_key",
-    "azure": "azure_api_key",
-    "cohere": "cohere_api_key",
-    "cohere_chat": "cohere_api_key",
-    "openai": "openai_api_key",
-    "openrouter": "openrouter_api_key",
-    "replicate": "replicate_api_key",
+# Per-call kwargs that decide WHERE litellm sends the request.
+_DESTINATION_KEYS = ("model", "custom_llm_provider")
+
+# Params scoped to a destination: correct for the one they were configured against
+# and wrong for any other, so they are dropped when a call redirects elsewhere.
+_DESTINATION_SCOPED_PARAMS = ("api_base", "organization", "extra_headers", "base_model")
+
+# A provider's key lives in the field named `<provider>_api_key`, so the mapping is
+# derived from the declared fields rather than restated. Only litellm provider ids
+# that do NOT follow that convention need an entry here.
+_PROVIDER_FIELD_ALIASES = {
+    "cohere_chat": "cohere",
+    "text-completion-openai": "openai",
+    "azure_text": "azure",
 }
+
+
+def _provider_api_key_field(provider: Optional[str]) -> Optional[str]:
+    """Name the field holding this provider's key, or None if there is no such field.
+
+    Checking against ``model_fields`` keeps this honest: a field that is renamed or
+    removed stops resolving, instead of reading as unset through ``getattr``.
+    """
+    if not provider:
+        return None
+    field = f"{_PROVIDER_FIELD_ALIASES.get(provider, provider)}_api_key"
+    return field if field in ChatLiteLLM.model_fields else None
 
 
 class ChatLiteLLMException(Exception):
@@ -423,6 +438,8 @@ class ChatLiteLLM(BaseChatModel):
     replicate_api_key: Optional[str] = None
     cohere_api_key: Optional[str] = None
     openrouter_api_key: Optional[str] = None
+    huggingface_api_key: Optional[str] = None
+    together_ai_api_key: Optional[str] = None
     api_key: Optional[str] = None
     streaming: bool = False
     api_base: Optional[str] = None
@@ -487,12 +504,34 @@ class ChatLiteLLM(BaseChatModel):
             **self.model_kwargs,
         }
 
-    def _resolve_api_key(self) -> Optional[str]:
-        """Resolve the key to send to litellm.
+    def _constructor_destination(self) -> Tuple[Optional[str], Optional[str]]:
+        """The model and provider this instance sends to when a call overrides neither.
+
+        ``model_kwargs`` is merged last into ``_default_params``, so an entry there
+        for ``model`` or ``custom_llm_provider`` is what actually reaches litellm
+        and must decide the credential too.
+        """
+        overrides = self.model_kwargs or {}
+        model = overrides.get("model") or (
+            self.model_name if self.model_name is not None else self.model
+        )
+        provider = overrides.get("custom_llm_provider") or self.custom_llm_provider
+        return model, provider
+
+    def _resolve_api_key(
+        self,
+        model: Optional[str] = None,
+        custom_llm_provider: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve the key to send to litellm for this call.
 
         ``api_key`` wins when set. Otherwise fall back to the provider-specific
-        field matching the model's provider, so a key supplied as, say,
+        field matching the provider, so a key supplied as, say,
         ``openai_api_key`` is actually used rather than silently ignored.
+
+        ``model`` and ``custom_llm_provider`` are the EFFECTIVE values for this
+        call, either of which a caller may override per call. Both decide where
+        litellm sends the request, so both must decide which key travels with it.
 
         Returns ``None`` when nothing is configured, leaving litellm to resolve
         credentials from the environment exactly as before.
@@ -500,34 +539,87 @@ class ChatLiteLLM(BaseChatModel):
         if self.api_key:
             return self.api_key
 
-        provider = self.custom_llm_provider
+        default_model, default_provider = self._constructor_destination()
+        provider = custom_llm_provider or default_provider
         if not provider:
-            model = self.model_name if self.model_name is not None else self.model
+            effective_model = model or default_model
+            if not effective_model:
+                return None
             try:
-                _, provider, _, _ = litellm.get_llm_provider(model=model)
+                _, provider, _, _ = litellm.get_llm_provider(model=effective_model)
             except Exception:
                 # litellm raises for model strings it cannot attribute. Defer to
                 # its own credential resolution rather than guessing a provider.
+                logger.debug(
+                    "No provider attributed to %r; leaving api_key unset.",
+                    effective_model,
+                )
                 return None
 
-        field = _PROVIDER_API_KEY_FIELDS.get(provider or "")
+        field = _provider_api_key_field(provider)
         if field is None:
             return None
         # validate_environment defaults these fields to "" rather than None.
         return getattr(self, field, None) or None
 
+    def _merge_call_params(
+        self, params: Dict[str, Any], kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Merge per-call kwargs over the client params, rescoping the destination.
+
+        ``_client_params`` is built from constructor state, so every value in it
+        that depends on WHERE the request goes — the credential, the endpoint, the
+        organization, the provider-specific headers, the cost-tracking model — is
+        resolved against the constructor's destination. A caller may redirect the
+        request per call with ``model`` or ``custom_llm_provider``.
+
+        When that happens, values scoped to the old destination must not follow the
+        request to the new one: the credential is re-resolved, and the rest are
+        dropped so litellm resolves them for the destination actually being used. A
+        caller who wants one of them at the new destination passes it in this call,
+        which wins by the merge.
+
+        A ``None`` override means "not supplied", matching how litellm reads params.
+        """
+        merged = {**params, **kwargs}
+
+        # None means omitted: fall back rather than sending a null destination.
+        for key in _DESTINATION_KEYS:
+            if key in kwargs and kwargs[key] is None:
+                merged[key] = params.get(key)
+
+        redirected = {
+            key: kwargs[key] for key in _DESTINATION_KEYS if kwargs.get(key) is not None
+        }
+        if not redirected:
+            return merged
+
+        if kwargs.get("api_key") is None:
+            merged["api_key"] = self._resolve_api_key(
+                model=redirected.get("model"),
+                custom_llm_provider=redirected.get("custom_llm_provider"),
+            )
+        for key in _DESTINATION_SCOPED_PARAMS:
+            if kwargs.get(key) is None:
+                merged.pop(key, None)
+        return merged
+
     @property
     def _client_params(self) -> Dict[str, Any]:
         """Get the per-call parameters passed to litellm.completion."""
         creds: Dict[str, Any] = {
-            "timeout": self.request_timeout,
             "api_base": self.api_base,
             "api_key": self._resolve_api_key(),
             "organization": self.organization,
+            "extra_headers": self.extra_headers,
         }
-        if self.extra_headers is not None:
-            creds["extra_headers"] = self.extra_headers
-        return {**self._default_params, **creds}
+        # Only override a default that is actually configured. An unset credential
+        # would otherwise clobber the same key supplied through model_kwargs, and
+        # litellm treats a missing param and a None one identically anyway.
+        return {
+            **self._default_params,
+            **{key: value for key, value in creds.items() if value is not None},
+        }
 
     def completion_with_retry(
         self, run_manager: Optional[CallbackManagerForLLMRun] = None, **kwargs: Any
@@ -623,7 +715,7 @@ class ChatLiteLLM(BaseChatModel):
             return generate_from_stream(stream_iter)
 
         message_dicts, params = self._create_message_dicts(messages, stop)
-        params = {**params, **kwargs}
+        params = self._merge_call_params(params, kwargs)
         response = self.completion_with_retry(
             messages=message_dicts, run_manager=run_manager, **params
         )
@@ -681,7 +773,7 @@ class ChatLiteLLM(BaseChatModel):
         **kwargs: Any,
     ) -> Iterator[ChatGenerationChunk]:
         message_dicts, params = self._create_message_dicts(messages, stop)
-        params = {**params, **kwargs, "stream": True}
+        params = {**self._merge_call_params(params, kwargs), "stream": True}
         if self.stream_options is not None:
             params["stream_options"] = self.stream_options
         else:
@@ -751,7 +843,7 @@ class ChatLiteLLM(BaseChatModel):
         **kwargs: Any,
     ) -> AsyncIterator[ChatGenerationChunk]:
         message_dicts, params = self._create_message_dicts(messages, stop)
-        params = {**params, **kwargs, "stream": True}
+        params = {**self._merge_call_params(params, kwargs), "stream": True}
         if self.stream_options is not None:
             params["stream_options"] = self.stream_options
         else:
@@ -828,7 +920,7 @@ class ChatLiteLLM(BaseChatModel):
             return await agenerate_from_stream(stream_iter)
 
         message_dicts, params = self._create_message_dicts(messages, stop)
-        params = {**params, **kwargs}
+        params = self._merge_call_params(params, kwargs)
         response = await self.acompletion_with_retry(
             messages=message_dicts, run_manager=run_manager, **params
         )

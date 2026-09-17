@@ -18,6 +18,7 @@ from langchain_core.messages import (
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 
 from langchain_litellm.chat_models.litellm import (
+    _DESTINATION_SCOPED_PARAMS,
     ChatLiteLLM,
     _convert_delta_to_message_chunk,
     _convert_dict_to_message,
@@ -58,12 +59,11 @@ class ChatLiteLLMRouter(ChatLiteLLM):
         return "LiteLLMRouter"
 
     def _prepare_params_for_router(self, params: Any) -> None:
-        # allow the router to set api_base based on its model choice
-        api_base_key_name = "api_base"
-        if api_base_key_name in params and params[api_base_key_name] is None:
-            del params[api_base_key_name]
+        """Add the metadata slot the Router fills in.
 
-        # add metadata so router can fill it below
+        Letting the Router choose ``api_base`` from its deployment is handled in
+        ``_merge_call_params``, which removes the connector's before this point.
+        """
         params.setdefault("metadata", {})
 
     def set_default_model(self, model_name: str) -> None:
@@ -81,6 +81,37 @@ class ChatLiteLLMRouter(ChatLiteLLM):
                 self.model = model_name
                 return
         raise ValueError(f"Model {model_name} not found in model_list.")
+
+    def _merge_call_params(
+        self, params: Dict[str, Any], kwargs: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Drop destination-scoped params on every call, not only on a redirect.
+
+        ``litellm.Router`` selects a deployment per request, so a value configured
+        on this connector is scoped to a destination the Router may not choose.
+        Each deployment carries its own endpoint, credential and headers in its
+        ``litellm_params``; forwarding the connector's would override them. A caller
+        who wants one for this specific call passes it here, and it wins by merge.
+        """
+        merged = super()._merge_call_params(params, kwargs)
+        for key in _DESTINATION_SCOPED_PARAMS:
+            if kwargs.get(key) is None:
+                merged.pop(key, None)
+        return merged
+
+    def _resolve_api_key(
+        self,
+        model: Optional[str] = None,
+        custom_llm_provider: Optional[str] = None,
+    ) -> Optional[str]:
+        """Never infer a provider key here; deployments carry their own.
+
+        ``litellm.Router`` resolves each deployment's credential from its own
+        ``litellm_params``. A provider-scoped field picked up from the
+        environment would be forwarded as a clientside key and override that,
+        so only an explicitly supplied ``api_key`` is passed through.
+        """
+        return self.api_key or None
 
     def completion_with_retry(
         self, run_manager: Optional[CallbackManagerForLLMRun] = None, **kwargs: Any
@@ -136,7 +167,7 @@ class ChatLiteLLMRouter(ChatLiteLLM):
             return generate_from_stream(stream_iter)
 
         message_dicts, params = self._create_message_dicts(messages, stop)
-        params = {**params, **kwargs}
+        params = self._merge_call_params(params, kwargs)
         params = {k: v for k, v in params.items() if v is not None}
         self._prepare_params_for_router(params)
 
@@ -154,7 +185,7 @@ class ChatLiteLLMRouter(ChatLiteLLM):
     ) -> Iterator[ChatGenerationChunk]:
         default_chunk_class = AIMessageChunk
         message_dicts, params = self._create_message_dicts(messages, stop)
-        params = {**params, **kwargs, "stream": True}
+        params = {**self._merge_call_params(params, kwargs), "stream": True}
         params = {k: v for k, v in params.items() if v is not None}
         params["stream_options"] = (
             self.stream_options
@@ -215,7 +246,7 @@ class ChatLiteLLMRouter(ChatLiteLLM):
     ) -> AsyncIterator[ChatGenerationChunk]:
         default_chunk_class = AIMessageChunk
         message_dicts, params = self._create_message_dicts(messages, stop)
-        params = {**params, **kwargs, "stream": True}
+        params = {**self._merge_call_params(params, kwargs), "stream": True}
         params = {k: v for k, v in params.items() if v is not None}
         params["stream_options"] = (
             self.stream_options
@@ -284,7 +315,7 @@ class ChatLiteLLMRouter(ChatLiteLLM):
             return await agenerate_from_stream(stream_iter)
 
         message_dicts, params = self._create_message_dicts(messages, stop)
-        params = {**params, **kwargs}
+        params = self._merge_call_params(params, kwargs)
         params = {k: v for k, v in params.items() if v is not None}
         self._prepare_params_for_router(params)
 
