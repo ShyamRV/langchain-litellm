@@ -257,6 +257,117 @@ def test_env_collected_keys_have_fields_to_land_in(_no_provider_env: None) -> No
     assert _provider_api_key_field("together_ai") == "together_ai_api_key"
 
 
+def test_an_ambient_env_key_is_not_sent_as_a_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """litellm resolves the environment itself, and an explicit key overrides it.
+
+    Passing back a value read from the environment beats `litellm.api_key` and the
+    other module globals, so configuring litellm programmatically stops working.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+    llm = ChatLiteLLM(model="gpt-4o")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs.get("api_key") is None
+
+
+def test_an_ambient_env_key_does_not_follow_a_redirect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pinned gateway holds the credential steady, so it must hold a real one.
+
+    Freezing a key the caller never supplied sends an OpenAI environment key to an
+    arbitrary endpoint as the credential for an Anthropic model.
+    """
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient")
+    llm = ChatLiteLLM(model="gpt-4o", api_base="https://gateway.internal/v1")
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", model="anthropic/claude-3-5-sonnet-20241022")
+
+    kwargs = mock_completion.call_args.kwargs
+    assert kwargs.get("api_key") is None
+    assert kwargs["api_base"] == "https://gateway.internal/v1"
+
+
+def test_no_provider_key_configured_skips_the_registry_lookup(
+    _no_provider_env: None,
+) -> None:
+    """litellm prints a banner to stdout for every model it cannot attribute.
+
+    With no provider-scoped key set there is nothing to attribute, so a proxy
+    deployment name must not cost a lookup and that banner on every request.
+    """
+    llm = ChatLiteLLM(model="my-deployment")
+
+    with patch.object(litellm, "get_llm_provider") as mock_lookup, patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ):
+        llm.invoke("hi", custom_llm_provider="openai")
+
+    mock_lookup.assert_not_called()
+
+
+def test_a_subclass_provider_key_field_is_forwarded(_no_provider_env: None) -> None:
+    """Resolution reads the runtime class, so a subclass can add a provider.
+
+    Pinning the base class drops a field the subclass declares and accepts, which
+    is the silent discard this resolution exists to stop.
+    """
+
+    class _DeepSeekChat(ChatLiteLLM):
+        deepseek_api_key: Optional[str] = None
+
+    llm = _DeepSeekChat(
+        model="deepseek/deepseek-chat", deepseek_api_key="sk-deepseek"
+    )
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-deepseek"
+
+
+def test_an_unexpected_provider_lookup_error_surfaces(_no_provider_env: None) -> None:
+    """Only litellm's own "cannot attribute this model" is a reason to give up.
+
+    Swallowing anything else silently stops forwarding the key, reproducing the bug
+    this resolution fixes with no signal that it happened.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", openai_api_key="sk-openai")
+
+    with patch.object(
+        litellm, "get_llm_provider", side_effect=TypeError("signature changed")
+    ):
+        with pytest.raises(TypeError):
+            llm._client_params
+
+
+def test_model_kwargs_decides_the_timeout(_no_provider_env: None) -> None:
+    """`model_kwargs` is merged last, so it decides every parameter it names.
+
+    `timeout` used to be the one exception, overwritten by `request_timeout` after
+    the merge.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", request_timeout=7, model_kwargs={"timeout": 42})
+
+    with patch.object(
+        llm.client, "completion", return_value=_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi")
+
+    assert mock_completion.call_args.kwargs["timeout"] == 42
+
+
 def test_redirect_re_resolves_only_the_inferred_credential(
     _no_provider_env: None,
 ) -> None:

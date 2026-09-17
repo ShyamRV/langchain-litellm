@@ -99,6 +99,23 @@ def test_router_does_not_forward_an_ambient_provider_key(
     assert mock_completion.call_args.kwargs.get("api_key") is None
 
 
+def test_router_keeps_a_model_kwargs_api_key_across_a_redirect() -> None:
+    """A key in `model_kwargs` is explicit caller config, so a redirect keeps it.
+
+    Withholding a key is only ever right for one inferred from the destination.
+    """
+    llm = ChatLiteLLMRouter(
+        router=make_router(), model_kwargs={"api_key": "sk-caller"}
+    )
+
+    with patch.object(
+        llm.router, "completion", return_value=_router_usage()
+    ) as mock_completion:
+        llm.invoke("hi", model="gpt-3.5-turbo")
+
+    assert mock_completion.call_args.kwargs["api_key"] == "sk-caller"
+
+
 def test_router_provider_specific_fields_in_chat_result() -> None:
     """Test that Router preserves top-level provider_specific_fields."""
     router = make_router()
