@@ -531,8 +531,8 @@ class ChatLiteLLM(BaseChatModel):
         call, either of which a caller may override per call. Both decide where
         litellm sends the request, so both must decide which key travels with it.
 
-        Returns ``None`` when nothing is configured, leaving litellm to resolve
-        credentials from the environment exactly as before.
+        Returns ``None`` when the caller configured nothing, leaving every
+        environment variable to litellm's own resolution.
         """
         if self.api_key:
             return self.api_key
@@ -666,7 +666,7 @@ class ChatLiteLLM(BaseChatModel):
 
     @pre_init
     def validate_environment(cls, values: Dict) -> Dict:
-        """Validate api key, python package exists, temperature, top_p, and top_k."""
+        """Normalize the ``base_url`` alias and validate temperature, top_p and top_k."""
         # Accept `base_url` as an alias for `api_base` for cross-provider
         # consistency (e.g. `init_chat_model(..., base_url=...)`). Without this,
         # `base_url` is silently dropped by Pydantic's `extra="ignore"`. The

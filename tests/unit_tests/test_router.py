@@ -75,10 +75,9 @@ def test_router_does_not_forward_an_ambient_provider_key(
 ) -> None:
     """A router deployment's own credential must not be overridden.
 
-    `validate_environment` fills `openai_api_key` from the environment even when
-    the caller passes nothing, and `ChatLiteLLMRouter` inherits `_client_params`.
-    Forwarding that value would reach litellm as a clientside credential and take
-    precedence over the key configured on the deployment itself.
+    litellm treats a passed `api_key` as a clientside credential that wins over the
+    one configured on the deployment, so a key the caller never supplied must not
+    travel with the call.
     """
     monkeypatch.setenv("OPENAI_API_KEY", "sk-ambient-openai")
     llm = ChatLiteLLMRouter(router=make_router())
