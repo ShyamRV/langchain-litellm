@@ -2,6 +2,10 @@
 
 # stdlib
 import logging
+import subprocess
+import sys
+from collections import OrderedDict, defaultdict
+from pathlib import Path
 from typing import Any, Dict, Optional, Union
 from unittest.mock import patch
 
@@ -13,7 +17,7 @@ from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain_core.runnables import RunnableLambda
 from litellm.types.utils import ChatCompletionDeltaToolCall, Delta, Function
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 # first-party
 from langchain_litellm._version import __version__
@@ -861,3 +865,275 @@ def test_init_chat_model_forwards_base_url() -> None:
 
     assert isinstance(llm, ChatLiteLLM)
     assert llm.api_base == "https://proxy.example/v1"
+
+
+_STREAM_MOCK_OK = {
+    "choices": [
+        {"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}
+    ],
+    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+}
+
+
+def test_stream_actually_streams_without_opting_in() -> None:
+    """`.stream()` must reach `_stream` for a caller who never mentioned streaming.
+
+    `@pre_init` hands pydantic a fully-populated dict, so every field read as
+    explicitly set. langchain-core treats an explicitly-set `streaming=False` as a
+    hard opt-out that overrides even the `stream=True` its own `.stream()` passes,
+    so `.stream()` silently fell back to `invoke()`.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k")
+    assert "streaming" not in llm.model_fields_set
+    assert llm._should_stream(async_api=False, stream=True) is True
+
+
+def test_explicit_streaming_false_still_opts_out() -> None:
+    """A caller who deliberately says `streaming=False` keeps the hard opt-out."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=False)
+    assert "streaming" in llm.model_fields_set
+    assert llm._should_stream(async_api=False, stream=True) is False
+
+
+def test_fields_set_distinguishes_a_chosen_streaming_flag_from_the_default() -> None:
+    """`streaming` is the one field langchain-core reads out of `model_fields_set`.
+
+    It treats a set `streaming=False` as a hard opt-out overriding a per-call
+    `stream=True`, so the default must not look chosen.
+    """
+    assert "streaming" not in ChatLiteLLM(model="gpt-4o", api_key="k").model_fields_set
+    assert "streaming" in ChatLiteLLM(model="gpt-4o", streaming=False).model_fields_set
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["model", "streaming", "max_retries", "model_kwargs", "disable_streaming"],
+)
+def test_an_explicit_none_falls_back_to_the_default(field: str) -> None:
+    """A config built from JSON or os.getenv carries nulls for unset values.
+
+    These fields are not Optional, so a None that reaches pydantic is rejected.
+    Dropping it leaves the default in place and, unlike backfilling the default,
+    keeps the field out of `model_fields_set` where langchain-core reads it.
+    """
+    kwargs: Dict[str, Any] = {"model": "anthropic/claude-3-5-sonnet-20241022"}
+    kwargs[field] = None
+    llm = ChatLiteLLM(**kwargs)  # type: ignore[arg-type]
+
+    assert getattr(llm, field) == ChatLiteLLM.model_fields[field].get_default(
+        call_default_factory=True
+    )
+    assert field not in llm.model_fields_set
+
+
+def test_a_null_streaming_still_streams() -> None:
+    """`streaming=None` means unset, so it must not read as a chosen opt-out.
+
+    A type checker rejects this, which is why only config-driven callers hit it.
+    """
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=None)  # type: ignore[arg-type]
+
+    assert "streaming" not in llm.model_fields_set
+
+
+def test_a_validator_assigned_field_counts_as_set() -> None:
+    """`base_url` reaches `api_base` through a validator, so a round-trip keeps it.
+
+    `model_dump(exclude_unset=True)` is how a configuration is carried between
+    processes; dropping a field no kwarg named loses the endpoint the caller chose.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4",
+        api_key="k",
+        base_url="https://proxy.example/v1",  # type: ignore[call-arg]
+    )
+
+    config = llm.model_dump(exclude_unset=True)
+
+    assert config["api_base"] == "https://proxy.example/v1"
+    assert ChatLiteLLM(**config).api_base == "https://proxy.example/v1"
+
+
+def test_stream_false_is_not_overridden_by_a_streaming_instance() -> None:
+    """The non-streaming branch parses a mapping, so it must send stream=False."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=True)
+
+    with patch.object(
+        llm.client, "completion", return_value=_STREAM_MOCK_OK
+    ) as mock_completion:
+        llm.invoke("hi", stream=False)
+
+    assert mock_completion.call_args.kwargs["stream"] is False
+
+
+def test_per_call_stream_options_are_not_discarded() -> None:
+    """`_stream` overwrote a per-call value with the instance one or the default."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=True)
+
+    def _chunks(**kwargs: Any) -> Any:
+        yield {
+            "choices": [
+                {"delta": {"role": "assistant", "content": "x"}, "finish_reason": None}
+            ]
+        }
+
+    with patch.object(llm.client, "completion", side_effect=_chunks) as mock_completion:
+        list(llm.stream("hi", stream_options={"include_usage": False}))
+
+    assert mock_completion.call_args.kwargs["stream_options"] == {
+        "include_usage": False
+    }
+
+
+@pytest.mark.asyncio
+async def test_astream_false_is_not_overridden_by_a_streaming_instance() -> None:
+    """The async twin of the branch that parses a mapping."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=True)
+
+    async def _response(**kwargs: Any) -> Any:
+        return _STREAM_MOCK_OK
+
+    with patch.object(
+        llm.client, "acompletion", side_effect=_response
+    ) as mock_completion:
+        await llm.ainvoke("hi", stream=False)
+
+    assert mock_completion.call_args.kwargs["stream"] is False
+
+
+@pytest.mark.asyncio
+async def test_per_call_stream_options_are_not_discarded_on_the_async_path() -> None:
+    """`_astream` carries the same caller configuration as `_stream`."""
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", streaming=True)
+
+    async def _chunks(**kwargs: Any) -> Any:
+        async def _aiter() -> Any:
+            yield {
+                "choices": [
+                    {
+                        "delta": {"role": "assistant", "content": "x"},
+                        "finish_reason": None,
+                    }
+                ]
+            }
+
+        return _aiter()
+
+    with patch.object(
+        llm.client, "acompletion", side_effect=_chunks
+    ) as mock_completion:
+        async for _ in llm.astream("hi", stream_options={"include_usage": False}):
+            pass
+
+    assert mock_completion.call_args.kwargs["stream_options"] == {
+        "include_usage": False
+    }
+
+
+def test_credentials_are_not_shown_in_repr() -> None:
+    """A key in repr() reaches logs and tracebacks."""
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        api_key="sk-generic",
+        openai_api_key="sk-openai",
+        azure_api_key="sk-azure",
+        anthropic_api_key="sk-anthropic",
+        replicate_api_key="sk-replicate",
+        cohere_api_key="sk-cohere",
+        openrouter_api_key="sk-openrouter",
+    )
+    assert "sk-" not in repr(llm)
+
+
+def test_every_credential_field_is_kept_out_of_repr() -> None:
+    """A provider added later must not arrive without the same protection."""
+    for name, field in ChatLiteLLM.model_fields.items():
+        if name in ("api_key", "extra_headers") or name.endswith("_api_key"):
+            assert field.repr is False, name
+
+
+def test_a_token_in_extra_headers_is_not_shown_in_repr() -> None:
+    """`extra_headers` is how a caller reaches a gateway, so it carries a token."""
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        extra_headers={"Authorization": "Bearer sk-should-not-appear"},
+    )
+    assert "sk-should-not-appear" not in repr(llm)
+
+
+def test_copying_model_kwargs_preserves_the_container_type() -> None:
+    """A caller's defaultdict must not come back as a plain dict.
+
+    `model_kwargs` is the escape hatch for provider payloads, so the type the
+    caller chose is part of the value.
+    """
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        api_key="k",
+        model_kwargs={"cfg": defaultdict(list), "ord": OrderedDict(b=2)},
+    )
+
+    params = llm._default_params
+
+    assert isinstance(params["cfg"], defaultdict)
+    assert params["cfg"]["missing"] == []
+    assert isinstance(params["ord"], OrderedDict)
+
+
+def test_a_self_referential_model_kwarg_does_not_recurse_forever() -> None:
+    """Copying has to terminate on a value that contains itself."""
+    cyclic: Dict[str, Any] = {}
+    cyclic["self"] = cyclic
+    llm = ChatLiteLLM(model="gpt-4o", api_key="k", model_kwargs={"c": cyclic})
+
+    copied = llm._default_params["c"]
+
+    assert copied is not cyclic
+    assert copied["self"] is copied
+
+
+def test_a_non_mapping_input_raises_a_validation_error() -> None:
+    """The validator's guard must hand pydantic the bad input, not crash inside it."""
+    with pytest.raises(ValidationError):
+        ChatLiteLLM.model_validate([1, 2])
+
+
+def test_client_params_does_not_alias_model_kwargs() -> None:
+    """A caller mutating the returned params must not reach back into the model."""
+    llm = ChatLiteLLM(
+        model="gpt-4o",
+        api_key="k",
+        model_kwargs={"top": {"nested": {"a": 1}}, "items": [{"b": 2}]},
+    )
+    params = llm._client_params
+    params["top"]["nested"]["a"] = 999
+    params["items"][0]["b"] = 999
+
+    # Copying only the first level would leave both of these aliased.
+    assert llm.model_kwargs["top"]["nested"]["a"] == 1
+    assert llm.model_kwargs["items"][0]["b"] == 2
+
+
+def test_constructor_signature_is_not_erased(tmp_path: Path) -> None:
+    """Nothing may replace pydantic's synthesized `__init__`.
+
+    An override taking `**kwargs` silently stops type checkers flagging an unknown
+    or mistyped field, and only a type checker can see it: the two are identical at
+    runtime.
+    """
+    pytest.importorskip("mypy")
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "from langchain_litellm import ChatLiteLLM\n"
+        "ChatLiteLLM(not_a_real_field=1)\n"
+        "ChatLiteLLM(temperature='warm')\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "mypy", "--no-incremental", str(probe)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert "call-arg" in result.stdout, result.stdout
+    assert "arg-type" in result.stdout, result.stdout
