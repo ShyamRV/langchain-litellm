@@ -79,8 +79,32 @@ class ChatLiteLLMRouter(ChatLiteLLM):
         for entry in model_list:
             if entry["model_name"] == model_name:
                 self.model = model_name
+                # _default_params prefers model_name, so setting only `model`
+                # would leave the previous default in force.
+                self.model_name = model_name
                 return
         raise ValueError(f"Model {model_name} not found in model_list.")
+
+    def _is_claude_model(self) -> bool:
+        """Answer for the deployment, not the Router alias.
+
+        ``model``/``model_name`` here is the Router's alias, which need not contain
+        the provider's model name at all, so the base implementation would miss a
+        Claude deployment routed under an unrelated alias.
+        """
+        alias = self.model_name or self.model
+        matched = [
+            entry
+            for entry in self.router.model_list or []
+            if entry.get("model_name") == alias
+        ]
+        if not matched:
+            return super()._is_claude_model()
+        # A model group can fan across providers, so any Claude deployment counts.
+        return any(
+            "claude" in str(entry.get("litellm_params", {}).get("model", "")).lower()
+            for entry in matched
+        )
 
     def completion_with_retry(
         self, run_manager: Optional[CallbackManagerForLLMRun] = None, **kwargs: Any
@@ -137,6 +161,9 @@ class ChatLiteLLMRouter(ChatLiteLLM):
 
         message_dicts, params = self._create_message_dicts(messages, stop)
         params = self._merge_call_params(params, kwargs)
+        # This branch parses a mapping, so it must not inherit stream=True from a
+        # streaming=True instance that the caller overrode with stream=False.
+        params["stream"] = False
         params = {k: v for k, v in params.items() if v is not None}
         self._prepare_params_for_router(params)
 
@@ -155,12 +182,19 @@ class ChatLiteLLMRouter(ChatLiteLLM):
         default_chunk_class = AIMessageChunk
         message_dicts, params = self._create_message_dicts(messages, stop)
         params = {**self._merge_call_params(params, kwargs), "stream": True}
-        params = {k: v for k, v in params.items() if v is not None}
-        params["stream_options"] = (
-            self.stream_options
-            if self.stream_options is not None
-            else {"include_usage": True}
-        )
+        if "stream_options" not in kwargs:
+            params["stream_options"] = (
+                self.stream_options
+                if self.stream_options is not None
+                else {"include_usage": True}
+            )
+        # After the default, so a caller's explicit None survives the way it does on
+        # the base class rather than being filtered out here.
+        params = {
+            key: value
+            for key, value in params.items()
+            if value is not None or key == "stream_options"
+        }
         self._prepare_params_for_router(params)
         first_chunk_yielded = False
 
@@ -216,12 +250,19 @@ class ChatLiteLLMRouter(ChatLiteLLM):
         default_chunk_class = AIMessageChunk
         message_dicts, params = self._create_message_dicts(messages, stop)
         params = {**self._merge_call_params(params, kwargs), "stream": True}
-        params = {k: v for k, v in params.items() if v is not None}
-        params["stream_options"] = (
-            self.stream_options
-            if self.stream_options is not None
-            else {"include_usage": True}
-        )
+        if "stream_options" not in kwargs:
+            params["stream_options"] = (
+                self.stream_options
+                if self.stream_options is not None
+                else {"include_usage": True}
+            )
+        # After the default, so a caller's explicit None survives the way it does on
+        # the base class rather than being filtered out here.
+        params = {
+            key: value
+            for key, value in params.items()
+            if value is not None or key == "stream_options"
+        }
         self._prepare_params_for_router(params)
         first_chunk_yielded = False
 
@@ -285,6 +326,9 @@ class ChatLiteLLMRouter(ChatLiteLLM):
 
         message_dicts, params = self._create_message_dicts(messages, stop)
         params = self._merge_call_params(params, kwargs)
+        # This branch parses a mapping, so it must not inherit stream=True from a
+        # streaming=True instance that the caller overrode with stream=False.
+        params["stream"] = False
         params = {k: v for k, v in params.items() if v is not None}
         self._prepare_params_for_router(params)
 
@@ -307,8 +351,13 @@ class ChatLiteLLMRouter(ChatLiteLLM):
                 continue
             token_usage = output["token_usage"]
             if token_usage is not None:
-                # get dict from LiteLLM Usage class
-                for k, v in token_usage.model_dump().items():
+                # May be a litellm Usage model or the plain dict a caller mocked.
+                usage_items = (
+                    token_usage.model_dump()
+                    if hasattr(token_usage, "model_dump")
+                    else dict(token_usage)
+                )
+                for k, v in usage_items.items():
                     if k in overall_token_usage and overall_token_usage[k] is not None:
                         overall_token_usage[k] += v
                     else:
